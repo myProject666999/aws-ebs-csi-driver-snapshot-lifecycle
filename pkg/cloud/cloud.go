@@ -136,6 +136,8 @@ const (
 	SnapshotNameTagKey = "CSIVolumeSnapshotName"
 	// KubernetesTagKeyPrefix is the prefix of the key value that is reserved for Kubernetes.
 	KubernetesTagKeyPrefix = "kubernetes.io"
+	// isManagedByDriverTagValue is the tag value marking a resource as managed by the EBS CSI driver.
+	isManagedByDriverTagValue = "true"
 )
 
 // Tags that depend on driver name (initialized in NewCloud).
@@ -215,6 +217,12 @@ var (
 
 	// ErrLimitExceeded is returned if a user exceeds a quota.
 	ErrLimitExceeded = errors.New("limit exceeded")
+
+	// ErrSnapshotFailed is returned when EC2 reports the newly created snapshot is in the error state.
+	ErrSnapshotFailed = errors.New("snapshot creation failed")
+
+	// ErrInvalidPaginationToken is returned when EC2 rejects a ListSnapshots pagination token.
+	ErrInvalidPaginationToken = errors.New("invalid pagination token")
 )
 
 // Set during build time via -ldflags.
@@ -238,6 +246,11 @@ var (
 	volumeIDRegex   = regexp.MustCompile(util.VolumeIDRegex)
 	snapshotIDRegex = regexp.MustCompile(util.SnapshotIDRegex)
 	instanceIDRegex = regexp.MustCompile(util.InstanceIDRegex)
+
+	// snapshotIDAnchoredRegex matches a complete, well-formed snapshot ID and rejects
+	// malformed values (e.g. "foo"). The unanchored snapshotIDRegex above is still used
+	// to harvest IDs from EC2 error messages.
+	snapshotIDAnchoredRegex = regexp.MustCompile(`^snap-[a-z0-9-]+$`)
 )
 
 var invalidParameterErrorCodes = map[string]struct{}{
@@ -322,6 +335,10 @@ type Snapshot struct {
 	Size           int32
 	CreationTime   time.Time
 	ReadyToUse     bool
+	// State is the EC2 snapshot state (pending, completed, error, recovering, recoverable).
+	State types.SnapshotState
+	// StateMessage is the EC2-provided message associated with State, if any.
+	StateMessage string
 }
 
 // ListSnapshotsResponse is the container for our snapshots along with a pagination token to pass back to the caller.
@@ -436,6 +453,9 @@ type cloud struct {
 	accountID             string
 	accountIDOnce         sync.Once
 	attemptDryRun         atomic.Bool
+	// listSnapshotsRestrictToDriverTags scopes unfiltered ListSnapshots calls (no volume ID)
+	// to snapshots carrying the AwsEbsDriverTagKey. Volume-scoped listings are unaffected.
+	listSnapshotsRestrictToDriverTags bool
 }
 
 var _ Cloud = &cloud{}
@@ -450,7 +470,7 @@ func initVariables() {
 
 // NewCloud returns a new instance of AWS cloud
 // It panics if session is invalid.
-func NewCloud(region string, awsSdkDebugLog bool, userAgentExtra string, batchingEnabled bool, deprecatedMetrics bool) Cloud {
+func NewCloud(region string, awsSdkDebugLog bool, userAgentExtra string, batchingEnabled bool, deprecatedMetrics bool, listSnapshotsRestrictToDriverTags bool) Cloud {
 	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
 	if err != nil {
 		panic(err)
@@ -515,19 +535,20 @@ func NewCloud(region string, awsSdkDebugLog bool, userAgentExtra string, batchin
 		bm = newBatcherManager(ec2Client)
 	}
 	c := &cloud{
-		awsConfig:             cfg,
-		region:                region,
-		dm:                    dm.NewDeviceManager(),
-		ec2:                   ec2Client,
-		sm:                    smClient,
-		bm:                    bm,
-		rm:                    newRetryManager(),
-		vwp:                   vwp,
-		likelyBadDeviceNames:  expiringcache.New[string, sync.Map](cacheForgetDelay),
-		latestClientTokens:    expiringcache.New[string, int](cacheForgetDelay),
-		volumeInitializations: expiringcache.New[string, volumeInitialization](volInitCacheForgetDelay),
-		latestIOPSLimits:      expiringcache.New[string, iopsLimits](iopsLimitCacheForgetDelay),
-		cardCountCache:        expiringcache.New[string, int](cacheForgetDelay),
+		awsConfig:                         cfg,
+		region:                            region,
+		dm:                                dm.NewDeviceManager(),
+		ec2:                               ec2Client,
+		sm:                                smClient,
+		bm:                                bm,
+		rm:                                newRetryManager(),
+		vwp:                               vwp,
+		likelyBadDeviceNames:              expiringcache.New[string, sync.Map](cacheForgetDelay),
+		latestClientTokens:                expiringcache.New[string, int](cacheForgetDelay),
+		volumeInitializations:             expiringcache.New[string, volumeInitialization](volInitCacheForgetDelay),
+		latestIOPSLimits:                  expiringcache.New[string, iopsLimits](iopsLimitCacheForgetDelay),
+		cardCountCache:                    expiringcache.New[string, int](cacheForgetDelay),
+		listSnapshotsRestrictToDriverTags: listSnapshotsRestrictToDriverTags,
 	}
 
 	// Ensure an EC2 Dry-run API call is made on startup and every dryRunInterval
@@ -2130,22 +2151,34 @@ func (c *cloud) CreateSnapshot(ctx context.Context, volumeID string, snapshotOpt
 		o.Retryer = c.rm.createSnapshotRetryer
 	})
 	if err != nil {
-		if isAwsErrorSnapshotLimitExceeded(err) {
+		switch {
+		case isAwsErrorSnapshotLimitExceeded(err):
 			return nil, fmt.Errorf("%w: %w", ErrLimitExceeded, err)
+		case isAWSErrorVolumeNotFound(err):
+			return nil, fmt.Errorf("%w: %w", ErrSourceNotFound, err)
+		case isAWSErrorInvalidParameter(err), isAWSErrorIncorrectState(err):
+			return nil, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		default:
+			return nil, fmt.Errorf("error creating snapshot of volume %s: %w", volumeID, err)
 		}
-		return nil, fmt.Errorf("error creating snapshot of volume %s: %w", volumeID, err)
 	}
 	if res == nil {
 		return nil, errors.New("nil CreateSnapshotResponse")
 	}
+	if res.State == types.SnapshotStateError {
+		// The snapshot is not deleted: the caller is responsible for deleting and recreating it.
+		return nil, fmt.Errorf("%w: snapshot %s is in error state: %s",
+			ErrSnapshotFailed, aws.ToString(res.SnapshotId), aws.ToString(res.StateMessage))
+	}
 
-	return &Snapshot{
-		SnapshotID:     aws.ToString(res.SnapshotId),
-		SourceVolumeID: aws.ToString(res.VolumeId),
-		Size:           *res.VolumeSize,
-		CreationTime:   aws.ToTime(res.StartTime),
-		ReadyToUse:     res.State == types.SnapshotStateCompleted,
-	}, nil
+	return c.ec2SnapshotResponseToStruct(types.Snapshot{
+		SnapshotId:   res.SnapshotId,
+		VolumeId:     res.VolumeId,
+		VolumeSize:   res.VolumeSize,
+		StartTime:    res.StartTime,
+		State:        res.State,
+		StateMessage: res.StateMessage,
+	}), nil
 }
 
 func (c *cloud) LockSnapshot(ctx context.Context, lockOptions *SnapshotLockOptions) error {
@@ -2164,13 +2197,17 @@ func (c *cloud) LockSnapshot(ctx context.Context, lockOptions *SnapshotLockOptio
 }
 
 func (c *cloud) DeleteSnapshot(ctx context.Context, snapshotID string) (success bool, err error) {
+	if !snapshotIDAnchoredRegex.MatchString(snapshotID) {
+		klog.Warningf("DeleteSnapshot: malformed snapshot ID %q, treating as not found without an EC2 call", snapshotID)
+		return false, ErrNotFound
+	}
 	request := &ec2.DeleteSnapshotInput{}
 	request.SnapshotId = aws.String(snapshotID)
 	request.DryRun = aws.Bool(false)
 	if _, err := c.ec2.DeleteSnapshot(ctx, request, func(o *ec2.Options) {
 		o.Retryer = c.rm.deleteSnapshotRetryer
 	}); err != nil {
-		if isAWSErrorSnapshotNotFound(err) {
+		if isAWSErrorSnapshotNotFound(err) || isAWSErrorSnapshotIDMalformed(err) {
 			return false, ErrNotFound
 		}
 		return false, fmt.Errorf("DeleteSnapshot could not delete snapshot: %w", err)
@@ -2197,12 +2234,19 @@ func (c *cloud) GetSnapshotByName(ctx context.Context, name string) (snapshot *S
 }
 
 func (c *cloud) GetSnapshotByID(ctx context.Context, snapshotID string) (snapshot *Snapshot, err error) {
+	if !snapshotIDAnchoredRegex.MatchString(snapshotID) {
+		klog.Warningf("GetSnapshotByID: malformed snapshot ID %q, treating as not found without an EC2 call", snapshotID)
+		return nil, ErrNotFound
+	}
 	request := &ec2.DescribeSnapshotsInput{
 		SnapshotIds: []string{snapshotID},
 	}
 
 	ec2snapshot, err := c.getSnapshot(ctx, request)
 	if err != nil {
+		if isAWSErrorSnapshotIDMalformed(err) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 
@@ -2211,30 +2255,45 @@ func (c *cloud) GetSnapshotByID(ctx context.Context, snapshotID string) (snapsho
 
 // ListSnapshots retrieves AWS EBS snapshots for an optionally specified volume ID.  If maxResults is set, it will return up to maxResults snapshots.  If there are more snapshots than maxResults,
 // a next token value will be returned to the client as well.  They can use this token with subsequent calls to retrieve the next page of results.  If maxResults is not set (0),
-// there will be no restriction up to 1000 results (https://docs.aws.amazon.com/sdk-for-go/api/service/ec2/#DescribeSnapshotsInput).
+// no MaxResults restriction is sent to EC2, which returns up to 1000 results per page (https://docs.aws.amazon.com/sdk-for-go/api/service/ec2/#DescribeSnapshotsInput).
 func (c *cloud) ListSnapshots(ctx context.Context, volumeID string, maxResults int32, nextToken string) (listSnapshotsResponse *ListSnapshotsResponse, err error) {
 	if maxResults > 0 && maxResults < 5 {
 		return nil, ErrInvalidMaxResults
 	}
 
-	describeSnapshotsInput := &ec2.DescribeSnapshotsInput{
-		MaxResults: aws.Int32(maxResults),
+	describeSnapshotsInput := &ec2.DescribeSnapshotsInput{}
+	// A CSI max_entries of 0 means "unlimited"; omitting MaxResults lets EC2 apply its own page size.
+	if maxResults != 0 {
+		describeSnapshotsInput.MaxResults = aws.Int32(maxResults)
 	}
 
 	if len(nextToken) != 0 {
 		describeSnapshotsInput.NextToken = aws.String(nextToken)
 	}
-	if len(volumeID) != 0 {
+	switch {
+	case len(volumeID) != 0:
 		describeSnapshotsInput.Filters = []types.Filter{
 			{
 				Name:   aws.String("volume-id"),
 				Values: []string{volumeID},
 			},
 		}
+	case c.listSnapshotsRestrictToDriverTags:
+		// Scope account-wide listings to snapshots managed by this driver; shared/public and
+		// foreign snapshots are excluded. Listings with an explicit volume ID keep their own scope.
+		describeSnapshotsInput.Filters = []types.Filter{
+			{
+				Name:   aws.String("tag:" + AwsEbsDriverTagKey),
+				Values: []string{isManagedByDriverTagValue},
+			},
+		}
 	}
 
 	ec2SnapshotsResponse, err := c.listSnapshots(ctx, describeSnapshotsInput)
 	if err != nil {
+		if isAWSErrorInvalidPaginationToken(err) {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidPaginationToken, err)
+		}
 		return nil, err
 	}
 
@@ -2254,21 +2313,18 @@ func (c *cloud) ListSnapshots(ctx context.Context, volumeID string, maxResults i
 }
 
 // Helper method converting EC2 snapshot type to the internal struct.
+// Only the completed state marks a snapshot ready to use; pending, error, recovering and
+// recoverable snapshots are all not ready. Nil EC2 fields map to zero values to avoid panics.
 func (c *cloud) ec2SnapshotResponseToStruct(ec2Snapshot types.Snapshot) *Snapshot {
-	snapshotSize := *ec2Snapshot.VolumeSize
-	snapshot := &Snapshot{
+	return &Snapshot{
 		SnapshotID:     aws.ToString(ec2Snapshot.SnapshotId),
 		SourceVolumeID: aws.ToString(ec2Snapshot.VolumeId),
-		Size:           snapshotSize,
-		CreationTime:   *ec2Snapshot.StartTime,
+		Size:           aws.ToInt32(ec2Snapshot.VolumeSize),
+		CreationTime:   aws.ToTime(ec2Snapshot.StartTime),
+		ReadyToUse:     ec2Snapshot.State == types.SnapshotStateCompleted,
+		State:          ec2Snapshot.State,
+		StateMessage:   aws.ToString(ec2Snapshot.StateMessage),
 	}
-	if ec2Snapshot.State == types.SnapshotStateCompleted {
-		snapshot.ReadyToUse = true
-	} else {
-		snapshot.ReadyToUse = false
-	}
-
-	return snapshot
 }
 
 func (c *cloud) EnableFastSnapshotRestores(ctx context.Context, availabilityZones []string, snapshotID string) (*ec2.EnableFastSnapshotRestoresOutput, error) {
@@ -2658,6 +2714,20 @@ func isAWSErrorModificationNotFound(err error) bool {
 // reported when the specified snapshot doesn't exist.
 func isAWSErrorSnapshotNotFound(err error) bool {
 	return isAWSError(err, "InvalidSnapshot.NotFound")
+}
+
+// isAWSErrorSnapshotIDMalformed returns a boolean indicating whether the
+// given error is an AWS InvalidSnapshotID.Malformed error. This error is
+// reported when the specified snapshot ID is not valid.
+func isAWSErrorSnapshotIDMalformed(err error) bool {
+	return isAWSError(err, "InvalidSnapshotID.Malformed")
+}
+
+// isAWSErrorInvalidPaginationToken returns a boolean indicating whether the
+// given error is an AWS InvalidPaginationToken error, which is reported when
+// a pagination token is invalid or has expired.
+func isAWSErrorInvalidPaginationToken(err error) bool {
+	return isAWSError(err, "InvalidPaginationToken")
 }
 
 // isAWSErrorIdempotentParameterMismatch returns a boolean indicating whether the

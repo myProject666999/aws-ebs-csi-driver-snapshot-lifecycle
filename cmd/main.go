@@ -200,7 +200,7 @@ func main() {
 				userAgentExtra = string(driver.MetadataLabelerMode)
 			}
 		}
-		cloud = cloudPkg.NewCloud(region, options.AwsSdkDebugLog, userAgentExtra, options.Batching, options.DeprecatedMetrics)
+		cloud = cloudPkg.NewCloud(region, options.AwsSdkDebugLog, userAgentExtra, options.Batching, options.DeprecatedMetrics, options.ListSnapshotsRestrictToDriverTags)
 	}
 
 	k8sClient, err = cfg.K8sAPIClient()

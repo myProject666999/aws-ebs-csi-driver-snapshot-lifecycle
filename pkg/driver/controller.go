@@ -102,9 +102,14 @@ func (d *ControllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if err := validateCreateVolumeRequest(req); err != nil {
 		return nil, err
 	}
-	volSizeBytes, err := getVolSizeBytes(req)
+	requiredBytes, limitBytes, err := parseCapacityRange(req.GetCapacityRange())
 	if err != nil {
 		return nil, err
+	}
+	volSizeBytes := requiredBytes
+	if req.GetCapacityRange() == nil {
+		// Provisional default; a snapshot source overrides this with the snapshot size below.
+		volSizeBytes = cloud.DefaultVolumeSize
 	}
 	volName := req.GetName()
 	volCap := req.GetVolumeCapabilities()
@@ -376,6 +381,36 @@ func (d *ControllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 			volumeID = sourceVolume.GetVolumeId()
 		}
 	}
+
+	// Snapshot restore: validate the source snapshot and reconcile the requested capacity against
+	// its size. The clone branch (SourceVolumeID -> CopyVolumes) is intentionally not handled here.
+	if snapshotID != "" {
+		sourceSnapshot, snapErr := d.cloud.GetSnapshotByID(ctx, snapshotID)
+		if snapErr != nil {
+			if errors.Is(snapErr, cloud.ErrNotFound) {
+				return nil, status.Errorf(codes.NotFound, "Error source snapshot with snapshotID %q not found: %v", snapshotID, snapErr)
+			}
+			return nil, status.Errorf(codes.Internal, "Could not describe source snapshot %q: %v", snapshotID, snapErr)
+		}
+		snapshotSizeGiB := sourceSnapshot.Size
+		if req.GetCapacityRange() == nil {
+			// Without a CapacityRange, restore at the snapshot's own size instead of the driver default.
+			volSizeBytes = util.GiBToBytes(snapshotSizeGiB)
+		} else {
+			requestedGiB := util.BytesToGiB(requiredBytes)
+			if requestedGiB < snapshotSizeGiB {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"Requested volume size %d GiB is smaller than the source snapshot size %d GiB", requestedGiB, snapshotSizeGiB)
+			}
+			if limitBytes > 0 && util.BytesToGiB(limitBytes) < snapshotSizeGiB {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"Limit size %d GiB is smaller than the source snapshot size %d GiB", util.BytesToGiB(limitBytes), snapshotSizeGiB)
+			}
+			// A larger requested size is allowed; the filesystem is expanded during NodeStageVolume.
+			volSizeBytes = requiredBytes
+		}
+	}
+
 	var sourceTopology *volumeTopology
 	// create or clone a new volume
 	if volumeID != "" {
@@ -1090,12 +1125,20 @@ func (d *ControllerService) CreateSnapshot(ctx context.Context, req *csi.CreateS
 
 	snapshot, err = d.cloud.CreateSnapshot(ctx, volumeID, opts)
 	if err != nil {
-		if errors.Is(err, cloud.ErrAlreadyExists) {
+		switch {
+		case errors.Is(err, cloud.ErrAlreadyExists):
 			return nil, status.Errorf(codes.AlreadyExists, "Snapshot %q already exists", snapshotName)
-		} else if errors.Is(err, cloud.ErrLimitExceeded) {
+		case errors.Is(err, cloud.ErrLimitExceeded):
 			return nil, status.Errorf(codes.ResourceExhausted, "Could not create snapshot (resource exhausted) %q: %v", snapshotName, err)
+		case errors.Is(err, cloud.ErrSourceNotFound):
+			return nil, status.Errorf(codes.NotFound, "Could not create snapshot %q: source volume not found: %v", snapshotName, err)
+		case errors.Is(err, cloud.ErrInvalidArgument):
+			return nil, status.Errorf(codes.InvalidArgument, "Could not create snapshot %q: %v", snapshotName, err)
+		case errors.Is(err, cloud.ErrSnapshotFailed):
+			return nil, status.Errorf(codes.Aborted, "Could not create snapshot %q: %v", snapshotName, err)
+		default:
+			return nil, status.Errorf(codes.Internal, "Could not create snapshot %q: %v", snapshotName, err)
 		}
-		return nil, status.Errorf(codes.Internal, "Could not create snapshot %q: %v", snapshotName, err)
 	}
 
 	if len(fsrAvailabilityZones) > 0 {
@@ -1198,6 +1241,9 @@ func (d *ControllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 		}
 		if errors.Is(err, cloud.ErrInvalidMaxResults) {
 			return nil, status.Errorf(codes.InvalidArgument, "Error mapping MaxEntries to AWS MaxResults: %v", err)
+		}
+		if errors.Is(err, cloud.ErrInvalidPaginationToken) {
+			return nil, status.Errorf(codes.Aborted, "Invalid or expired starting token: %v", err)
 		}
 		return nil, status.Errorf(codes.Internal, "Could not list snapshots: %v", err)
 	}
@@ -1373,19 +1419,29 @@ func newListSnapshotsResponseEntry(snapshot *cloud.Snapshot) *csi.ListSnapshotsR
 	}
 }
 
-func getVolSizeBytes(req *csi.CreateVolumeRequest) (int64, error) {
-	var volSizeBytes int64
-	capRange := req.GetCapacityRange()
+// parseCapacityRange validates the CapacityRange and returns the rounded-up required size and
+// the limit size (0 means no limit). A nil CapacityRange returns zeros without an error.
+func parseCapacityRange(capRange *csi.CapacityRange) (requiredBytes, limitBytes int64, err error) {
 	if capRange == nil {
-		volSizeBytes = cloud.DefaultVolumeSize
-	} else {
-		volSizeBytes = util.RoundUpBytes(capRange.GetRequiredBytes())
-		maxVolSize := capRange.GetLimitBytes()
-		if maxVolSize > 0 && maxVolSize < volSizeBytes {
-			return 0, status.Error(codes.InvalidArgument, "After round-up, volume size exceeds the limit specified")
-		}
+		return 0, 0, nil
 	}
-	return volSizeBytes, nil
+	requiredBytes = util.RoundUpBytes(capRange.GetRequiredBytes())
+	limitBytes = capRange.GetLimitBytes()
+	if limitBytes > 0 && limitBytes < requiredBytes {
+		return 0, 0, status.Error(codes.InvalidArgument, "After round-up, volume size exceeds the limit specified")
+	}
+	return requiredBytes, limitBytes, nil
+}
+
+func getVolSizeBytes(req *csi.CreateVolumeRequest) (int64, error) {
+	requiredBytes, _, err := parseCapacityRange(req.GetCapacityRange())
+	if err != nil {
+		return 0, err
+	}
+	if req.GetCapacityRange() == nil {
+		return cloud.DefaultVolumeSize, nil
+	}
+	return requiredBytes, nil
 }
 
 // BuildOutpostArn returns the string representation of the outpost ARN from the given csi.TopologyRequirement.segments.
@@ -1438,7 +1494,10 @@ func isTrue(value string) bool {
 
 func (d *ControllerService) cleanupSnapshotOnError(ctx context.Context, snapshotID, snapshotName string, originalErr error, errorMsg string) error {
 	if _, deleteErr := d.cloud.DeleteSnapshot(ctx, snapshotID); deleteErr != nil {
-		return status.Errorf(codes.Internal, "Could not delete snapshot ID %q: %v", snapshotName, deleteErr)
+		klog.ErrorS(originalErr, "Snapshot operation failed and cleanup delete also failed",
+			"snapshotName", snapshotName, "snapshotID", snapshotID, "deleteErr", deleteErr)
+		return status.Errorf(codes.Internal, "Could not delete snapshot ID %q: %v (original error: %v)",
+			snapshotName, errors.Join(originalErr, deleteErr), originalErr)
 	}
 	return status.Errorf(codes.Internal, "%s for snapshot ID %q: %v", errorMsg, snapshotName, originalErr)
 }

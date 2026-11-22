@@ -97,19 +97,21 @@ func extractVolumeIdentifiers(volumes []types.Volume) (volumeIDs []string, volum
 
 func TestNewCloud(t *testing.T) {
 	testCases := []struct {
-		name              string
-		region            string
-		awsSdkDebugLog    bool
-		userAgentExtra    string
-		batchingEnabled   bool
-		deprecatedMetrics bool
+		name                              string
+		region                            string
+		awsSdkDebugLog                    bool
+		userAgentExtra                    string
+		batchingEnabled                   bool
+		deprecatedMetrics                 bool
+		listSnapshotsRestrictToDriverTags bool
 	}{
 		{
-			name:            "success: with awsSdkDebugLog, userAgentExtra, and batchingEnabled",
-			region:          "us-east-1",
-			awsSdkDebugLog:  true,
-			userAgentExtra:  "example_user_agent_extra",
-			batchingEnabled: true,
+			name:                              "success: with awsSdkDebugLog, userAgentExtra, and batchingEnabled",
+			region:                            "us-east-1",
+			awsSdkDebugLog:                    true,
+			userAgentExtra:                    "example_user_agent_extra",
+			batchingEnabled:                   true,
+			listSnapshotsRestrictToDriverTags: true,
 		},
 		{
 			name:           "success: with only awsSdkDebugLog, and userAgentExtra",
@@ -123,7 +125,7 @@ func TestNewCloud(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		ec2Cloud := NewCloud(tc.region, tc.awsSdkDebugLog, tc.userAgentExtra, tc.batchingEnabled, tc.deprecatedMetrics)
+		ec2Cloud := NewCloud(tc.region, tc.awsSdkDebugLog, tc.userAgentExtra, tc.batchingEnabled, tc.deprecatedMetrics, tc.listSnapshotsRestrictToDriverTags)
 		ec2CloudAscloud, ok := ec2Cloud.(*cloud)
 		if !ok {
 			t.Fatalf("could not assert object ec2Cloud as cloud type, %v", ec2Cloud)
@@ -134,6 +136,7 @@ func TestNewCloud(t *testing.T) {
 		} else {
 			assert.Nil(t, ec2CloudAscloud.bm)
 		}
+		assert.Equal(t, tc.listSnapshotsRestrictToDriverTags, ec2CloudAscloud.listSnapshotsRestrictToDriverTags)
 	}
 }
 func TestBatchDescribeVolumes(t *testing.T) {
@@ -3486,8 +3489,14 @@ func TestCreateSnapshot(t *testing.T) {
 		name            string
 		snapshotName    string
 		snapshotOptions *SnapshotOptions
+		state           types.SnapshotState
+		stateMessage    string
+		nilVolumeSize   bool
+		nilStartTime    bool
+		apiErr          error
 		expSnapshot     *Snapshot
 		expErr          error
+		expErrIs        error
 	}{
 		{
 			name:         "success: normal",
@@ -3499,13 +3508,14 @@ func TestCreateSnapshot(t *testing.T) {
 					"extra-tag-key":    "extra-tag-value",
 				},
 			},
+			state: types.SnapshotStateCompleted,
 			expSnapshot: &Snapshot{
 				SnapshotID:     "snap-test-name",
 				SourceVolumeID: "snap-test-volume",
 				Size:           10,
 				ReadyToUse:     true,
+				State:          types.SnapshotStateCompleted,
 			},
-			expErr: nil,
 		},
 		{
 			name:         "success: outpost",
@@ -3518,13 +3528,125 @@ func TestCreateSnapshot(t *testing.T) {
 				},
 				OutpostArn: "arn:aws:outposts:us-east-1:222222222222:outpost/aa-aaaaaaaaaaaaaaaaa",
 			},
+			state: types.SnapshotStateCompleted,
 			expSnapshot: &Snapshot{
 				SnapshotID:     "snap-test-name",
 				SourceVolumeID: "snap-test-volume",
 				Size:           10,
 				ReadyToUse:     true,
+				State:          types.SnapshotStateCompleted,
 			},
-			expErr: nil,
+		},
+		{
+			name:            "success: pending state is not ready",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			state:           types.SnapshotStatePending,
+			expSnapshot: &Snapshot{
+				SnapshotID:     "snap-test-name",
+				SourceVolumeID: "snap-test-volume",
+				Size:           10,
+				State:          types.SnapshotStatePending,
+			},
+		},
+		{
+			name:            "success: recovering state is not ready",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			state:           types.SnapshotStateRecovering,
+			expSnapshot: &Snapshot{
+				SnapshotID:     "snap-test-name",
+				SourceVolumeID: "snap-test-volume",
+				Size:           10,
+				State:          types.SnapshotStateRecovering,
+			},
+		},
+		{
+			name:            "success: recoverable state is not ready",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			state:           types.SnapshotStateRecoverable,
+			expSnapshot: &Snapshot{
+				SnapshotID:     "snap-test-name",
+				SourceVolumeID: "snap-test-volume",
+				Size:           10,
+				State:          types.SnapshotStateRecoverable,
+			},
+		},
+		{
+			name:            "success: empty unknown state is not ready",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			state:           "",
+			expSnapshot: &Snapshot{
+				SnapshotID:     "snap-test-name",
+				SourceVolumeID: "snap-test-volume",
+				Size:           10,
+				State:          "",
+			},
+		},
+		{
+			name:            "success: nil VolumeSize and StartTime do not panic",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			state:           types.SnapshotStatePending,
+			nilVolumeSize:   true,
+			nilStartTime:    true,
+			expSnapshot: &Snapshot{
+				SnapshotID:     "snap-test-name",
+				SourceVolumeID: "snap-test-volume",
+				Size:           0,
+				State:          types.SnapshotStatePending,
+			},
+		},
+		{
+			name:            "fail: snapshot created in error state",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			state:           types.SnapshotStateError,
+			stateMessage:    "the underlying volume encountered an error",
+			expSnapshot:     &Snapshot{SnapshotID: "snap-test-name", SourceVolumeID: "snap-test-volume"},
+			expErrIs:        ErrSnapshotFailed,
+		},
+		{
+			name:            "fail: source volume not found",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			apiErr:          &smithy.GenericAPIError{Code: "InvalidVolume.NotFound", Message: "Volume not found"},
+			expSnapshot:     &Snapshot{SourceVolumeID: "snap-test-volume"},
+			expErrIs:        ErrSourceNotFound,
+		},
+		{
+			name:            "fail: invalid parameter",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			apiErr:          &smithy.GenericAPIError{Code: "InvalidParameterValue", Message: "bad parameter"},
+			expSnapshot:     &Snapshot{SourceVolumeID: "snap-test-volume"},
+			expErrIs:        ErrInvalidArgument,
+		},
+		{
+			name:            "fail: incorrect volume state",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			apiErr:          &smithy.GenericAPIError{Code: "IncorrectState", Message: "volume is attached"},
+			expSnapshot:     &Snapshot{SourceVolumeID: "snap-test-volume"},
+			expErrIs:        ErrInvalidArgument,
+		},
+		{
+			name:            "fail: snapshot quota exceeded",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			apiErr:          &smithy.GenericAPIError{Code: "SnapshotLimitExceeded", Message: "quota"},
+			expSnapshot:     &Snapshot{SourceVolumeID: "snap-test-volume"},
+			expErrIs:        ErrLimitExceeded,
+		},
+		{
+			name:            "fail: generic API error",
+			snapshotName:    "snap-test-name",
+			snapshotOptions: &SnapshotOptions{Tags: map[string]string{SnapshotNameTagKey: "snap-test-name"}},
+			apiErr:          errors.New("generic failure"),
+			expSnapshot:     &Snapshot{SourceVolumeID: "snap-test-volume"},
+			expErr:          errors.New("error creating snapshot of volume snap-test-volume: generic failure"),
 		},
 	}
 
@@ -3538,64 +3660,102 @@ func TestCreateSnapshot(t *testing.T) {
 
 			mockEC2.EXPECT().CreateSnapshot(testutil.AnyContext(), testutil.EC2Input(&ec2.CreateSnapshotInput{}), testutil.EC2Options()).DoAndReturn(
 				func(ctx context.Context, input *ec2.CreateSnapshotInput, optFns ...func(*ec2.Options)) (*ec2.CreateSnapshotOutput, error) {
-					if input.VolumeId == nil || *input.VolumeId != tc.expSnapshot.SourceVolumeID {
-						t.Errorf("Unexpected VolumeId. Expected: %s, Actual: %s", tc.expSnapshot.SourceVolumeID, aws.ToString(input.VolumeId))
+					if tc.apiErr != nil {
+						return nil, tc.apiErr
 					}
-					if input.Description == nil || *input.Description != "Created by AWS EBS CSI driver for volume "+tc.expSnapshot.SourceVolumeID {
-						t.Errorf("Unexpected Description. Expected: %s, Actual: %s", "Created by AWS EBS CSI driver for volume "+tc.expSnapshot.SourceVolumeID, aws.ToString(input.Description))
+					out := &ec2.CreateSnapshotOutput{
+						SnapshotId:   aws.String(tc.expSnapshot.SnapshotID),
+						VolumeId:     aws.String(tc.expSnapshot.SourceVolumeID),
+						State:        tc.state,
+						StateMessage: aws.String(tc.stateMessage),
 					}
-					if len(input.TagSpecifications) != 1 {
-						t.Errorf("Unexpected number of TagSpecifications. Expected: 1, Actual: %d", len(input.TagSpecifications))
-					} else {
-						for expectedTagKey, expectedTagValue := range tc.snapshotOptions.Tags {
-							found := false
-							for _, actualTag := range input.TagSpecifications[0].Tags {
-								if aws.ToString(actualTag.Key) == expectedTagKey && aws.ToString(actualTag.Value) == expectedTagValue {
-									found = true
-									break
-								}
-							}
-							if !found {
-								t.Errorf("Expected tag not found. Key: %s, Value: %s", expectedTagKey, expectedTagValue)
-							}
-						}
+					if !tc.nilVolumeSize {
+						out.VolumeSize = aws.Int32(tc.expSnapshot.Size)
 					}
-					return &ec2.CreateSnapshotOutput{
-						SnapshotId: &tc.expSnapshot.SnapshotID,
-						VolumeId:   &tc.expSnapshot.SourceVolumeID,
-						VolumeSize: aws.Int32(tc.expSnapshot.Size),
-						StartTime:  aws.Time(tc.expSnapshot.CreationTime),
-						State:      types.SnapshotStateCompleted,
-					}, tc.expErr
+					if !tc.nilStartTime {
+						out.StartTime = aws.Time(tc.expSnapshot.CreationTime)
+					}
+					return out, nil
 				},
 			)
+			// An error-state snapshot must never be auto-deleted: no DeleteSnapshot expectation is set,
+			// so an unexpected delete call would fail the mock controller.
 
 			snapshot, err := c.CreateSnapshot(ctx, tc.expSnapshot.SourceVolumeID, tc.snapshotOptions)
-			if err != nil {
-				if tc.expErr == nil {
-					t.Fatalf("CreateSnapshot() failed: expected no error, got: %v", err)
+			if tc.expErrIs != nil || tc.expErr != nil {
+				if err == nil {
+					t.Fatalf("CreateSnapshot() failed: expected error, got nothing")
 				}
-				if err.Error() != tc.expErr.Error() {
+				if tc.expErrIs != nil && !errors.Is(err, tc.expErrIs) {
+					t.Fatalf("CreateSnapshot() failed: expected error wrapping %v, got %v", tc.expErrIs, err)
+				}
+				if tc.expErr != nil && err.Error() != tc.expErr.Error() {
 					t.Fatalf("CreateSnapshot() failed: expected error %q, got %q", tc.expErr, err)
 				}
-			} else {
-				if tc.expErr != nil {
-					t.Fatal("CreateSnapshot() failed: expected error, got nothing")
+				if tc.expErrIs == ErrSnapshotFailed && !strings.Contains(err.Error(), tc.stateMessage) {
+					t.Fatalf("Expected error to contain state message %q, got %v", tc.stateMessage, err)
 				}
-				if snapshot.SnapshotID != tc.expSnapshot.SnapshotID {
-					t.Fatalf("CreateSnapshot() failed: expected snapshot ID %q, got %q", tc.expSnapshot.SnapshotID, snapshot.SnapshotID)
-				}
-				if snapshot.SourceVolumeID != tc.expSnapshot.SourceVolumeID {
-					t.Fatalf("CreateSnapshot() failed: expected source volume ID %q, got %q", tc.expSnapshot.SourceVolumeID, snapshot.SourceVolumeID)
-				}
-				if snapshot.Size != tc.expSnapshot.Size {
-					t.Fatalf("CreateSnapshot() failed: expected size %d, got %d", tc.expSnapshot.Size, snapshot.Size)
-				}
-				if snapshot.ReadyToUse != tc.expSnapshot.ReadyToUse {
-					t.Fatalf("CreateSnapshot() failed: expected ready to use %t, got %t", tc.expSnapshot.ReadyToUse, snapshot.ReadyToUse)
-				}
+				mockCtrl.Finish()
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreateSnapshot() failed: expected no error, got: %v", err)
+			}
+			if snapshot.SnapshotID != tc.expSnapshot.SnapshotID {
+				t.Fatalf("CreateSnapshot() failed: expected snapshot ID %q, got %q", tc.expSnapshot.SnapshotID, snapshot.SnapshotID)
+			}
+			if snapshot.SourceVolumeID != tc.expSnapshot.SourceVolumeID {
+				t.Fatalf("CreateSnapshot() failed: expected source volume ID %q, got %q", tc.expSnapshot.SourceVolumeID, snapshot.SourceVolumeID)
+			}
+			if snapshot.Size != tc.expSnapshot.Size {
+				t.Fatalf("CreateSnapshot() failed: expected size %d, got %d", tc.expSnapshot.Size, snapshot.Size)
+			}
+			if snapshot.ReadyToUse != tc.expSnapshot.ReadyToUse {
+				t.Fatalf("CreateSnapshot() failed: expected ready to use %t, got %t", tc.expSnapshot.ReadyToUse, snapshot.ReadyToUse)
+			}
+			if snapshot.State != tc.state {
+				t.Fatalf("CreateSnapshot() failed: expected state %q, got %q", tc.state, snapshot.State)
+			}
+			if tc.stateMessage != "" && snapshot.StateMessage != tc.stateMessage {
+				t.Fatalf("CreateSnapshot() failed: expected state message %q, got %q", tc.stateMessage, snapshot.StateMessage)
 			}
 			mockCtrl.Finish()
+		})
+	}
+}
+
+func TestEC2SnapshotResponseToStruct(t *testing.T) {
+	creationTime := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+	testCases := []struct {
+		name     string
+		ec2Snap  types.Snapshot
+		expReady bool
+	}{
+		{name: "completed is ready", ec2Snap: types.Snapshot{State: types.SnapshotStateCompleted, VolumeSize: aws.Int32(10), StartTime: aws.Time(creationTime)}, expReady: true},
+		{name: "pending is not ready", ec2Snap: types.Snapshot{State: types.SnapshotStatePending, VolumeSize: aws.Int32(10)}, expReady: false},
+		{name: "error is not ready", ec2Snap: types.Snapshot{State: types.SnapshotStateError, StateMessage: aws.String("boom"), VolumeSize: aws.Int32(10)}, expReady: false},
+		{name: "recovering is not ready", ec2Snap: types.Snapshot{State: types.SnapshotStateRecovering, VolumeSize: aws.Int32(10)}, expReady: false},
+		{name: "recoverable is not ready", ec2Snap: types.Snapshot{State: types.SnapshotStateRecoverable, VolumeSize: aws.Int32(10)}, expReady: false},
+		{name: "unknown empty state is not ready", ec2Snap: types.Snapshot{State: "", VolumeSize: aws.Int32(10)}, expReady: false},
+		{name: "nil fields map to zero values without panic", ec2Snap: types.Snapshot{State: types.SnapshotStatePending}, expReady: false},
+	}
+
+	c := newCloud(NewMockEC2API(gomock.NewController(t))).(*cloud)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := c.ec2SnapshotResponseToStruct(tc.ec2Snap)
+			if snap.ReadyToUse != tc.expReady {
+				t.Fatalf("expected ReadyToUse %t, got %t", tc.expReady, snap.ReadyToUse)
+			}
+			if snap.State != tc.ec2Snap.State {
+				t.Fatalf("expected state %q, got %q", tc.ec2Snap.State, snap.State)
+			}
+			if tc.ec2Snap.VolumeSize == nil && snap.Size != 0 {
+				t.Fatalf("expected zero size for nil VolumeSize, got %d", snap.Size)
+			}
+			if tc.ec2Snap.StartTime == nil && !snap.CreationTime.IsZero() {
+				t.Fatalf("expected zero time for nil StartTime, got %v", snap.CreationTime)
+			}
 		})
 	}
 }
@@ -3743,25 +3903,50 @@ func TestDeleteSnapshot(t *testing.T) {
 	testCases := []struct {
 		name         string
 		snapshotName string
+		apiErr       error
 		expErr       error
+		expErrIs     error
+		noEC2Call    bool
 	}{
 		{
 			name:         "success: normal",
 			snapshotName: "snap-test-name",
-			expErr:       nil,
 		},
 		{
 			name:         "fail: delete snapshot return generic error",
 			snapshotName: "snap-test-name",
-			expErr:       errors.New("DeleteSnapshot generic error"),
+			apiErr:       errors.New("DeleteSnapshot generic error"),
+			expErr:       errors.New("DeleteSnapshot could not delete snapshot: DeleteSnapshot generic error"),
 		},
 		{
 			name:         "fail: delete snapshot return not found error",
 			snapshotName: "snap-test-name",
-			expErr: &smithy.GenericAPIError{
+			apiErr: &smithy.GenericAPIError{
 				Code:    "InvalidSnapshot.NotFound",
 				Message: "",
 			},
+			expErrIs: ErrNotFound,
+		},
+		{
+			name:         "fail: delete snapshot return malformed ID error",
+			snapshotName: "snap-test-name",
+			apiErr: &smithy.GenericAPIError{
+				Code:    "InvalidSnapshotID.Malformed",
+				Message: "",
+			},
+			expErrIs: ErrNotFound,
+		},
+		{
+			name:         "malformed: foo is treated as not found without an EC2 call",
+			snapshotName: "foo",
+			noEC2Call:    true,
+			expErrIs:     ErrNotFound,
+		},
+		{
+			name:         "malformed: empty ID is treated as not found without an EC2 call",
+			snapshotName: "",
+			noEC2Call:    true,
+			expErrIs:     ErrNotFound,
 		},
 	}
 
@@ -3772,20 +3957,24 @@ func TestDeleteSnapshot(t *testing.T) {
 			c := newCloud(mockEC2)
 
 			ctx := t.Context()
-			mockEC2.EXPECT().DeleteSnapshot(testutil.AnyContext(), gomock.Eq(&ec2.DeleteSnapshotInput{
-				SnapshotId: aws.String(tc.snapshotName),
-				DryRun:     aws.Bool(false),
-			}), testutil.EC2Options()).Return(&ec2.DeleteSnapshotOutput{}, tc.expErr)
+			if !tc.noEC2Call {
+				mockEC2.EXPECT().DeleteSnapshot(testutil.AnyContext(), gomock.Eq(&ec2.DeleteSnapshotInput{
+					SnapshotId: aws.String(tc.snapshotName),
+					DryRun:     aws.Bool(false),
+				}), testutil.EC2Options()).Return(&ec2.DeleteSnapshotOutput{}, tc.apiErr)
+			}
 
 			_, err := c.DeleteSnapshot(ctx, tc.snapshotName)
-			if err != nil {
-				if tc.expErr == nil {
-					t.Fatalf("DeleteSnapshot() failed: expected no error, got: %v", err)
+			if tc.expErrIs != nil {
+				if !errors.Is(err, tc.expErrIs) {
+					t.Fatalf("DeleteSnapshot() failed: expected error wrapping %v, got %v", tc.expErrIs, err)
 				}
-			} else {
-				if tc.expErr != nil {
-					t.Fatal("DeleteSnapshot() failed: expected error, got nothing")
+			} else if tc.expErr != nil {
+				if err == nil || err.Error() != tc.expErr.Error() {
+					t.Fatalf("DeleteSnapshot() failed: expected error %q, got %v", tc.expErr, err)
 				}
+			} else if err != nil {
+				t.Fatalf("DeleteSnapshot() failed: expected no error, got: %v", err)
 			}
 
 			mockCtrl.Finish()
@@ -4339,22 +4528,36 @@ func TestGetSnapshotByName(t *testing.T) {
 
 func TestGetSnapshotByID(t *testing.T) {
 	testCases := []struct {
-		name        string
-		snapshotID  string
-		expSnapshot *Snapshot
-		expErr      error
+		name       string
+		snapshotID string
+		apiErr     error
+		expErr     error
+		expErrIs   error
+		noEC2Call  bool
+		batching   bool
 	}{
 		{
 			name:       "success: normal",
 			snapshotID: "snap-test-name",
-			expSnapshot: &Snapshot{
-				SnapshotID:     "snap-test-name",
-				SourceVolumeID: "snap-test-volume",
-				Size:           10,
-				CreationTime:   time.Now(),
-				ReadyToUse:     true,
-			},
-			expErr: nil,
+		},
+		{
+			name:       "malformed: foo is treated as not found without an EC2 call",
+			snapshotID: "foo",
+			noEC2Call:  true,
+			expErrIs:   ErrNotFound,
+		},
+		{
+			name:       "malformed: EC2 InvalidSnapshotID.Malformed is normalized to not found",
+			snapshotID: "snap-test-name",
+			apiErr:     &smithy.GenericAPIError{Code: "InvalidSnapshotID.Malformed", Message: "malformed"},
+			expErrIs:   ErrNotFound,
+		},
+		{
+			name:       "malformed: batching enabled still normalizes InvalidSnapshotID.Malformed",
+			snapshotID: "snap-test-name",
+			apiErr:     &smithy.GenericAPIError{Code: "InvalidSnapshotID.Malformed", Message: "malformed"},
+			expErrIs:   ErrNotFound,
+			batching:   true,
 		},
 	}
 
@@ -4362,53 +4565,76 @@ func TestGetSnapshotByID(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mockCtrl := gomock.NewController(t)
 			mockEC2 := NewMockEC2API(mockCtrl)
-			c := newCloud(mockEC2)
+			c := newCloud(mockEC2).(*cloud)
+			if tc.batching {
+				c.bm = newBatcherManager(mockEC2)
+			}
+
+			expSnapshot := &Snapshot{
+				SnapshotID:     tc.snapshotID,
+				SourceVolumeID: "snap-test-volume",
+				Size:           10,
+				CreationTime:   time.Now(),
+				ReadyToUse:     true,
+				State:          types.SnapshotStateCompleted,
+			}
 
 			ec2snapshot := types.Snapshot{
 				SnapshotId: aws.String(tc.snapshotID),
-				VolumeId:   aws.String(tc.expSnapshot.SourceVolumeID),
-				VolumeSize: aws.Int32(tc.expSnapshot.Size),
-				StartTime:  aws.Time(tc.expSnapshot.CreationTime),
+				VolumeId:   aws.String(expSnapshot.SourceVolumeID),
+				VolumeSize: aws.Int32(expSnapshot.Size),
+				StartTime:  aws.Time(expSnapshot.CreationTime),
 				State:      types.SnapshotStateCompleted,
 			}
 
 			ctx := t.Context()
 
-			mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), testutil.EC2Input(&ec2.DescribeSnapshotsInput{})).Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{ec2snapshot}}, nil)
+			if !tc.noEC2Call {
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), testutil.EC2Input(&ec2.DescribeSnapshotsInput{})).Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{ec2snapshot}}, tc.apiErr)
+			}
 
 			snapshot, err := c.GetSnapshotByID(ctx, tc.snapshotID)
+			if tc.expErrIs != nil {
+				if !errors.Is(err, tc.expErrIs) {
+					t.Fatalf("GetSnapshotByID() failed: expected error wrapping %v, got %v", tc.expErrIs, err)
+				}
+				mockCtrl.Finish()
+				return
+			}
+			if tc.expErr != nil {
+				if err == nil || err.Error() != tc.expErr.Error() {
+					t.Fatalf("GetSnapshotByID() failed: expected error %q, got %v", tc.expErr, err)
+				}
+				mockCtrl.Finish()
+				return
+			}
 			if err != nil {
-				if tc.expErr == nil {
-					t.Fatalf("GetSnapshotByID() failed: expected no error, got: %v", err)
-				}
-				if err.Error() != tc.expErr.Error() {
-					t.Fatalf("GetSnapshotByID() failed: expected error %q, got %q", tc.expErr, err)
-				}
-			} else {
-				if tc.expErr != nil {
-					t.Fatal("GetSnapshotByID() failed: expected error, got nothing")
-				}
-				if snapshot.SnapshotID != tc.expSnapshot.SnapshotID {
-					t.Fatalf("GetSnapshotByID() failed: expected snapshot ID %q, got %q", tc.expSnapshot.SnapshotID, snapshot.SnapshotID)
-				}
-				if snapshot.SourceVolumeID != tc.expSnapshot.SourceVolumeID {
-					t.Fatalf("GetSnapshotByID() failed: expected source volume ID %q, got %q", tc.expSnapshot.SourceVolumeID, snapshot.SourceVolumeID)
-				}
-				if snapshot.Size != tc.expSnapshot.Size {
-					t.Fatalf("GetSnapshotByID() failed: expected size %d, got %d", tc.expSnapshot.Size, snapshot.Size)
-				}
-				if !snapshot.CreationTime.Equal(tc.expSnapshot.CreationTime) {
-					t.Fatalf("GetSnapshotByID() failed: expected creation time %v, got %v", tc.expSnapshot.CreationTime, snapshot.CreationTime)
-				}
-				if snapshot.ReadyToUse != tc.expSnapshot.ReadyToUse {
-					t.Fatalf("GetSnapshotByID() failed: expected ready to use %t, got %t", tc.expSnapshot.ReadyToUse, snapshot.ReadyToUse)
-				}
+				t.Fatalf("GetSnapshotByID() failed: expected no error, got: %v", err)
+			}
+			if snapshot.SnapshotID != expSnapshot.SnapshotID {
+				t.Fatalf("GetSnapshotByID() failed: expected snapshot ID %q, got %q", expSnapshot.SnapshotID, snapshot.SnapshotID)
+			}
+			if snapshot.SourceVolumeID != expSnapshot.SourceVolumeID {
+				t.Fatalf("GetSnapshotByID() failed: expected source volume ID %q, got %q", expSnapshot.SourceVolumeID, snapshot.SourceVolumeID)
+			}
+			if snapshot.Size != expSnapshot.Size {
+				t.Fatalf("GetSnapshotByID() failed: expected size %d, got %d", expSnapshot.Size, snapshot.Size)
+			}
+			if !snapshot.CreationTime.Equal(expSnapshot.CreationTime) {
+				t.Fatalf("GetSnapshotByID() failed: expected creation time %v, got %v", expSnapshot.CreationTime, snapshot.CreationTime)
+			}
+			if snapshot.ReadyToUse != expSnapshot.ReadyToUse {
+				t.Fatalf("GetSnapshotByID() failed: expected ready to use %t, got %t", expSnapshot.ReadyToUse, snapshot.ReadyToUse)
+			}
+			if snapshot.State != types.SnapshotStateCompleted {
+				t.Fatalf("GetSnapshotByID() failed: expected state completed, got %q", snapshot.State)
 			}
 
 			mockCtrl.Finish()
 		})
 	}
 }
+
 func TestListSnapshots(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -4674,6 +4900,155 @@ func TestListSnapshots(t *testing.T) {
 					}
 				} else {
 					t.Fatalf("Expected error, got none")
+				}
+			},
+		},
+		{
+			name: "success: maxResults 0 omits MaxResults, non-zero sets it",
+			testFunc: func(t *testing.T) {
+				t.Helper()
+				mockCtl := gomock.NewController(t)
+				defer mockCtl.Finish()
+				mockEC2 := NewMockEC2API(mockCtl)
+				c := newCloud(mockEC2)
+				ctx := t.Context()
+
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{{SnapshotId: aws.String("snap-1"), State: types.SnapshotStateCompleted}}}, nil).Times(1)
+				if _, err := c.ListSnapshots(ctx, "", 0, ""); err != nil {
+					t.Fatalf("ListSnapshots() with maxResults 0 failed: %v", err)
+				}
+
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{MaxResults: aws.Int32(5)})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{{SnapshotId: aws.String("snap-1"), State: types.SnapshotStateCompleted}}}, nil).Times(1)
+				if _, err := c.ListSnapshots(ctx, "", 5, ""); err != nil {
+					t.Fatalf("ListSnapshots() with maxResults 5 failed: %v", err)
+				}
+			},
+		},
+		{
+			name: "success: three page token round trip",
+			testFunc: func(t *testing.T) {
+				t.Helper()
+				mockCtl := gomock.NewController(t)
+				defer mockCtl.Finish()
+				mockEC2 := NewMockEC2API(mockCtl)
+				c := newCloud(mockEC2)
+				ctx := t.Context()
+
+				page := func(id string) types.Snapshot {
+					return types.Snapshot{SnapshotId: aws.String(id), VolumeSize: aws.Int32(1), StartTime: aws.Time(time.Now()), State: types.SnapshotStateCompleted}
+				}
+				firstCall := mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{page("snap-1"), page("snap-2"), page("snap-3"), page("snap-4"), page("snap-5")}, NextToken: aws.String("token-a")}, nil)
+				secondCall := mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{NextToken: aws.String("token-a")})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{page("snap-6"), page("snap-7"), page("snap-8"), page("snap-9"), page("snap-10")}, NextToken: aws.String("token-b")}, nil)
+				thirdCall := mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{NextToken: aws.String("token-b")})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{page("snap-11"), page("snap-12")}}, nil)
+				gomock.InOrder(firstCall, secondCall, thirdCall)
+
+				page1, err := c.ListSnapshots(ctx, "", 0, "")
+				if err != nil {
+					t.Fatalf("page 1 failed: %v", err)
+				}
+				if len(page1.Snapshots) != 5 || page1.NextToken != "token-a" {
+					t.Fatalf("unexpected page 1: %+v", page1)
+				}
+				page2, err := c.ListSnapshots(ctx, "", 0, page1.NextToken)
+				if err != nil {
+					t.Fatalf("page 2 failed: %v", err)
+				}
+				if len(page2.Snapshots) != 5 || page2.NextToken != "token-b" {
+					t.Fatalf("unexpected page 2: %+v", page2)
+				}
+				page3, err := c.ListSnapshots(ctx, "", 0, page2.NextToken)
+				if err != nil {
+					t.Fatalf("page 3 failed: %v", err)
+				}
+				if len(page3.Snapshots) != 2 || page3.NextToken != "" {
+					t.Fatalf("unexpected page 3: %+v", page3)
+				}
+			},
+		},
+		{
+			name: "fail: invalid pagination token maps to ErrInvalidPaginationToken",
+			testFunc: func(t *testing.T) {
+				t.Helper()
+				mockCtl := gomock.NewController(t)
+				defer mockCtl.Finish()
+				mockEC2 := NewMockEC2API(mockCtl)
+				c := newCloud(mockEC2)
+				ctx := t.Context()
+
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), testutil.EC2Input(&ec2.DescribeSnapshotsInput{})).
+					Return(nil, &smithy.GenericAPIError{Code: "InvalidPaginationToken", Message: "invalid token"})
+
+				_, err := c.ListSnapshots(ctx, "", 5, "bogus-token")
+				if !errors.Is(err, ErrInvalidPaginationToken) {
+					t.Fatalf("expected ErrInvalidPaginationToken, got %v", err)
+				}
+			},
+		},
+		{
+			name: "success: driver tag filter only applies to unfiltered listing when enabled",
+			testFunc: func(t *testing.T) {
+				t.Helper()
+				mockCtl := gomock.NewController(t)
+				defer mockCtl.Finish()
+				mockEC2 := NewMockEC2API(mockCtl)
+				c := newCloud(mockEC2).(*cloud)
+				c.listSnapshotsRestrictToDriverTags = true
+				ctx := t.Context()
+
+				driverTagFilter := []types.Filter{{Name: aws.String("tag:" + AwsEbsDriverTagKey), Values: []string{isManagedByDriverTagValue}}}
+				volumeFilter := []types.Filter{{Name: aws.String("volume-id"), Values: []string{"vol-123"}}}
+
+				// No volume ID: driver tag filter is present.
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{Filters: driverTagFilter})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{{SnapshotId: aws.String("snap-1"), State: types.SnapshotStateCompleted}}}, nil).Times(1)
+				if _, err := c.ListSnapshots(ctx, "", 0, ""); err != nil {
+					t.Fatalf("tag-filtered listing failed: %v", err)
+				}
+
+				// With a volume ID: only the volume-id filter is sent, no tag filter.
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{Filters: volumeFilter})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{{SnapshotId: aws.String("snap-2"), State: types.SnapshotStateCompleted}}}, nil).Times(1)
+				if _, err := c.ListSnapshots(ctx, "vol-123", 0, ""); err != nil {
+					t.Fatalf("volume-scoped listing failed: %v", err)
+				}
+			},
+		},
+		{
+			name: "success: toggle disabled sends no filters for unfiltered listing",
+			testFunc: func(t *testing.T) {
+				t.Helper()
+				mockCtl := gomock.NewController(t)
+				defer mockCtl.Finish()
+				mockEC2 := NewMockEC2API(mockCtl)
+				c := newCloud(mockEC2).(*cloud)
+				ctx := t.Context()
+
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), gomock.Eq(&ec2.DescribeSnapshotsInput{})).
+					Return(&ec2.DescribeSnapshotsOutput{Snapshots: []types.Snapshot{{SnapshotId: aws.String("snap-1"), State: types.SnapshotStateCompleted}}}, nil).Times(1)
+				if _, err := c.ListSnapshots(ctx, "", 0, ""); err != nil {
+					t.Fatalf("unfiltered listing failed: %v", err)
+				}
+			},
+		},
+		{
+			name: "success: nonexistent volume filter returns ErrNotFound",
+			testFunc: func(t *testing.T) {
+				t.Helper()
+				mockCtl := gomock.NewController(t)
+				defer mockCtl.Finish()
+				mockEC2 := NewMockEC2API(mockCtl)
+				c := newCloud(mockEC2)
+				ctx := t.Context()
+
+				mockEC2.EXPECT().DescribeSnapshots(testutil.AnyContext(), testutil.EC2Input(&ec2.DescribeSnapshotsInput{})).
+					Return(&ec2.DescribeSnapshotsOutput{}, nil)
+				if _, err := c.ListSnapshots(ctx, "vol-does-not-exist", 0, ""); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expected ErrNotFound, got %v", err)
 				}
 			},
 		},
@@ -5869,7 +6244,6 @@ func newCloud(mockEC2 util.EC2API) Cloud {
 	}
 	return c
 }
-
 func newDescribeInstancesOutput(nodeID string, volumeID ...string) *ec2.DescribeInstancesOutput {
 	instance := types.Instance{
 		InstanceId: aws.String(nodeID),

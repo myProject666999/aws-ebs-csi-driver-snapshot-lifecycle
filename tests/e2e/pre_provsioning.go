@@ -81,7 +81,7 @@ var _ = Describe("[ebs-csi-e2e] [functional] Pre-Provisioned", func() {
 		availabilityZone = availabilityZones[rand.Intn(len(availabilityZones))]
 		region := availabilityZone[0 : len(availabilityZone)-1]
 
-		cloud = awscloud.NewCloud(region, false, "", true, false)
+		cloud = awscloud.NewCloud(region, false, "", true, false, false)
 		diskOptions := &awscloud.DiskOptions{
 			CapacityBytes:    defaultDiskSizeBytes,
 			VolumeType:       defaultVolumeType,
@@ -253,7 +253,7 @@ var _ = Describe("[ebs-csi-e2e] [functional] Pre-Provisioned with Multi-Attach",
 		}
 		region := availabilityZone[0 : len(availabilityZone)-1]
 
-		cloud = awscloud.NewCloud(region, false, "", true, false)
+		cloud = awscloud.NewCloud(region, false, "", true, false, false)
 		diskOptions := &awscloud.DiskOptions{
 			CapacityBytes:      defaultDiskSizeBytes,
 			VolumeType:         awscloud.VolumeTypeIO2,

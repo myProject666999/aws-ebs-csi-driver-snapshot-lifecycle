@@ -65,6 +65,9 @@ func TestAddFlags(t *testing.T) {
 	if err := f.Set("batching", "true"); err != nil {
 		t.Errorf("error setting batching: %v", err)
 	}
+	if err := f.Set("list-snapshots-restrict-to-driver-tags", "true"); err != nil {
+		t.Errorf("error setting list-snapshots-restrict-to-driver-tags: %v", err)
+	}
 	if err := f.Set("modify-volume-request-handler-timeout", "1m"); err != nil {
 		t.Errorf("error setting modify-volume-request-handler-timeout: %v", err)
 	}
@@ -112,6 +115,9 @@ func TestAddFlags(t *testing.T) {
 	if !o.Batching {
 		t.Error("unexpected Batching: got false, want true")
 	}
+	if !o.ListSnapshotsRestrictToDriverTags {
+		t.Error("unexpected ListSnapshotsRestrictToDriverTags: got false, want true")
+	}
 	if o.ModifyVolumeRequestHandlerTimeout != time.Minute {
 		t.Errorf("unexpected ModifyVolumeRequestHandlerTimeout: got %v, want 1m", o.ModifyVolumeRequestHandlerTimeout)
 	}
@@ -152,7 +158,7 @@ func TestAddFlagsMetadataLabelerMode(t *testing.T) {
 	}
 
 	// Controller-only flags should NOT be registered for metadata labeler mode
-	controllerOnlyFlags := []string{"extra-tags", "k8s-tag-cluster-id", "batching", "modify-volume-request-handler-timeout"}
+	controllerOnlyFlags := []string{"extra-tags", "k8s-tag-cluster-id", "batching", "list-snapshots-restrict-to-driver-tags", "modify-volume-request-handler-timeout"}
 	for _, name := range controllerOnlyFlags {
 		if fl := f.Lookup(name); fl != nil {
 			t.Errorf("flag --%s should not be registered in MetadataLabelerMode", name)

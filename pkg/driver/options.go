@@ -67,6 +67,9 @@ type Options struct {
 	UserAgentExtra string
 	// flag to enable batching of API calls
 	Batching bool
+	// flag to restrict cluster-wide ListSnapshots calls (no source volume ID) to snapshots
+	// tagged as managed by this driver; volume-scoped listings are unaffected
+	ListSnapshotsRestrictToDriverTags bool
 	// flag to set the timeout for volume modification requests to be coalesced into a single
 	// volume modification call to AWS.
 	ModifyVolumeRequestHandlerTimeout time.Duration
@@ -128,6 +131,7 @@ func (o *Options) AddFlags(f *flag.FlagSet) {
 		f.StringVar(&o.KubernetesClusterID, "k8s-tag-cluster-id", "", "ID of the Kubernetes cluster used for tagging provisioned EBS volumes (optional).")
 		f.BoolVar(&o.WarnOnInvalidTag, "warn-on-invalid-tag", false, "To warn on invalid tags, instead of returning an error")
 		f.BoolVar(&o.Batching, "batching", false, "To enable batching of API calls. This is especially helpful for improving performance in workloads that are sensitive to EC2 rate limits.")
+		f.BoolVar(&o.ListSnapshotsRestrictToDriverTags, "list-snapshots-restrict-to-driver-tags", false, "If true, ListSnapshots calls without a source volume ID return only snapshots carrying the driver's managed-by tag, excluding shared and foreign snapshots. Volume-scoped listings are unaffected.")
 		f.DurationVar(&o.ModifyVolumeRequestHandlerTimeout, "modify-volume-request-handler-timeout", DefaultModifyVolumeRequestHandlerTimeout, "Timeout for the window in which volume modification calls must be received in order for them to coalesce into a single volume modification call to AWS. This must be lower than the csi-resizer and volumemodifier timeouts")
 		f.BoolVar(&o.DeprecatedMetrics, "deprecated-metrics", false, "DEPRECATED: To enable deprecated metrics. This parameter is only for backward compatibility and may be removed in a future release.")
 		f.BoolVar(&o.EnableNodeLocalVolumes, "enable-node-local-volumes", false, "Enable support for node-local volumes that use pre-attached EBS volumes.")
